@@ -418,6 +418,212 @@ Agent_OnUnload(JavaVM *vm)
     }
 }
 
+JNIEXPORT jint JNICALL
+Agent_OnAttach(JavaVM* vm, char* options, void* reserved){
+
+    jvmtiError error;
+    jvmtiCapabilities needed_capabilities;
+    jvmtiCapabilities potential_capabilities;
+    jint              jvmtiCompileTimeMajorVersion;
+    jint              jvmtiCompileTimeMinorVersion;
+    jint              jvmtiCompileTimeMicroVersion;
+    char              *boot_path = NULL;
+    char              npt_lib[MAXPATHLEN];
+
+    /* See if it's already loaded */
+    if ( gdata!=NULL && gdata->isLoaded==JNI_TRUE ) {
+        ERROR_MESSAGE(("Cannot load this JVM TI agent twice, check your java command line for duplicate jdwp options."));
+        return JNI_ERR;
+    }
+
+    /* If gdata is defined and the VM died, why are we here? */
+    if ( gdata!=NULL && gdata->vmDead ) {
+        ERROR_MESSAGE(("JDWP unable to load, VM died"));
+        return JNI_ERR;
+    }
+
+    /* Get global data area */
+    gdata = get_gdata();
+    if (gdata == NULL) {
+        ERROR_MESSAGE(("JDWP unable to allocate memory"));
+        return JNI_ERR;
+    }
+    gdata->isLoaded = JNI_TRUE;
+
+    /* Start filling in gdata */
+    gdata->jvm = vm;
+    vmInitialized = JNI_FALSE;
+    gdata->vmDead = JNI_FALSE;
+
+    /* Get the JVMTI Env, IMPORTANT: Do this first! For jvmtiAllocate(). */
+    error = JVM_FUNC_PTR(vm,GetEnv)
+                (vm, (void **)&(gdata->jvmti), JVMTI_VERSION_1);
+    if (error != JNI_OK) {
+        ERROR_MESSAGE(("JDWP unable to access JVMTI Version 1 (0x%x),"
+                         " is your J2SE a 1.5 or newer version?"
+                         " JNIEnv's GetEnv() returned %d",
+                         JVMTI_VERSION_1, error));
+        forceExit(1); /* Kill entire process, no core dump */
+    }
+
+    /* Check to make sure the version of jvmti.h we compiled with
+     *      matches the runtime version we are using.
+     */
+    jvmtiCompileTimeMajorVersion  = ( JVMTI_VERSION & JVMTI_VERSION_MASK_MAJOR )
+                                        >> JVMTI_VERSION_SHIFT_MAJOR;
+    jvmtiCompileTimeMinorVersion  = ( JVMTI_VERSION & JVMTI_VERSION_MASK_MINOR )
+                                        >> JVMTI_VERSION_SHIFT_MINOR;
+    jvmtiCompileTimeMicroVersion  = ( JVMTI_VERSION & JVMTI_VERSION_MASK_MICRO )
+                                        >> JVMTI_VERSION_SHIFT_MICRO;
+
+    /* Check for compatibility */
+    if ( !compatible_versions(jvmtiMajorVersion(), jvmtiMinorVersion(),
+                jvmtiCompileTimeMajorVersion, jvmtiCompileTimeMinorVersion) ) {
+
+        ERROR_MESSAGE(("This jdwp native library will not work with this VM's "
+                       "version of JVMTI (%d.%d.%d), it needs JVMTI %d.%d[.%d].",
+                       jvmtiMajorVersion(),
+                       jvmtiMinorVersion(),
+                       jvmtiMicroVersion(),
+                       jvmtiCompileTimeMajorVersion,
+                       jvmtiCompileTimeMinorVersion,
+                       jvmtiCompileTimeMicroVersion));
+
+        /* Do not let VM get a fatal error, we don't want a core dump here. */
+        forceExit(1); /* Kill entire process, no core dump wanted */
+    }
+
+    JVMTI_FUNC_PTR(gdata->jvmti, GetSystemProperty)
+        (gdata->jvmti, (const char *)"sun.boot.library.path",
+         &boot_path);
+
+    dbgsysBuildLibName(npt_lib, sizeof(npt_lib), boot_path, NPT_LIBNAME);
+    /* Npt and Utf function init */
+    NPT_INITIALIZE(npt_lib, &(gdata->npt), NPT_VERSION, NULL);
+    jvmtiDeallocate(boot_path);
+    if (gdata->npt == NULL) {
+        ERROR_MESSAGE(("JDWP: unable to initialize NPT library"));
+        return JNI_ERR;
+    }
+    gdata->npt->utf = (gdata->npt->utfInitialize)(NULL);
+    if (gdata->npt->utf == NULL) {
+        ERROR_MESSAGE(("JDWP: UTF function initialization failed"));
+        return JNI_ERR;
+    }
+
+    /* Parse input options */
+    if (!parseOptions(options)) {
+        /* No message necessary, should have been printed out already */
+        /* Do not let VM get a fatal error, we don't want a core dump here. */
+        forceExit(1); /* Kill entire process, no core dump wanted */
+    }
+
+    LOG_MISC(("Onload: %s", options));
+
+    /* Get potential capabilities */
+    (void)memset(&potential_capabilities,0,sizeof(potential_capabilities));
+    error = JVMTI_FUNC_PTR(gdata->jvmti,GetPotentialCapabilities)
+                (gdata->jvmti, &potential_capabilities);
+    if (error != JVMTI_ERROR_NONE) {
+        ERROR_MESSAGE(("JDWP unable to get potential JVMTI capabilities: %s(%d)",
+                        jvmtiErrorText(error), error));
+        return JNI_ERR;
+    }
+
+    /* Fill in ones that we must have */
+    (void)memset(&needed_capabilities,0,sizeof(needed_capabilities));
+    needed_capabilities.can_access_local_variables              = 1;
+    needed_capabilities.can_generate_single_step_events         = 1;
+    needed_capabilities.can_generate_exception_events           = 1;
+    needed_capabilities.can_generate_frame_pop_events           = 1;
+    needed_capabilities.can_generate_breakpoint_events          = 1;
+    needed_capabilities.can_suspend                             = 1;
+    needed_capabilities.can_generate_method_entry_events        = 1;
+    needed_capabilities.can_generate_method_exit_events         = 1;
+    needed_capabilities.can_generate_garbage_collection_events  = 1;
+    needed_capabilities.can_maintain_original_method_order      = 1;
+    needed_capabilities.can_generate_monitor_events             = 1;
+    needed_capabilities.can_tag_objects                         = 1;
+
+    /* And what potential ones that would be nice to have */
+    needed_capabilities.can_force_early_return
+                = potential_capabilities.can_force_early_return;
+    needed_capabilities.can_generate_field_modification_events
+                = potential_capabilities.can_generate_field_modification_events;
+    needed_capabilities.can_generate_field_access_events
+                = potential_capabilities.can_generate_field_access_events;
+    needed_capabilities.can_get_bytecodes
+                = potential_capabilities.can_get_bytecodes;
+    needed_capabilities.can_get_synthetic_attribute
+                = potential_capabilities.can_get_synthetic_attribute;
+    needed_capabilities.can_get_owned_monitor_info
+                = potential_capabilities.can_get_owned_monitor_info;
+    needed_capabilities.can_get_current_contended_monitor
+                = potential_capabilities.can_get_current_contended_monitor;
+    needed_capabilities.can_get_monitor_info
+                = potential_capabilities.can_get_monitor_info;
+    needed_capabilities.can_pop_frame
+                = potential_capabilities.can_pop_frame;
+    needed_capabilities.can_redefine_classes
+                = potential_capabilities.can_redefine_classes;
+    needed_capabilities.can_redefine_any_class
+                = potential_capabilities.can_redefine_any_class;
+    needed_capabilities.can_get_owned_monitor_stack_depth_info
+        = potential_capabilities.can_get_owned_monitor_stack_depth_info;
+    needed_capabilities.can_get_constant_pool
+                = potential_capabilities.can_get_constant_pool;
+    {
+        needed_capabilities.can_get_source_debug_extension      = 1;
+        needed_capabilities.can_get_source_file_name            = 1;
+        needed_capabilities.can_get_line_numbers                = 1;
+        needed_capabilities.can_signal_thread
+                = potential_capabilities.can_signal_thread;
+    }
+
+    /* Add the capabilities */
+    error = JVMTI_FUNC_PTR(gdata->jvmti,AddCapabilities)
+                (gdata->jvmti, &needed_capabilities);
+    if (error != JVMTI_ERROR_NONE) {
+        ERROR_MESSAGE(("JDWP unable to get necessary JVMTI capabilities."));
+        forceExit(1); /* Kill entire process, no core dump wanted */
+    }
+
+    /* Initialize event number mapping tables */
+    eventIndexInit();
+
+    /* Set the initial JVMTI event notifications */
+    error = set_event_notification(JVMTI_ENABLE, EI_VM_DEATH);
+    if (error != JVMTI_ERROR_NONE) {
+        return JNI_ERR;
+    }
+    error = set_event_notification(JVMTI_ENABLE, EI_VM_INIT);
+    if (error != JVMTI_ERROR_NONE) {
+        return JNI_ERR;
+    }
+    if (initOnUncaught || (initOnException != NULL)) {
+        error = set_event_notification(JVMTI_ENABLE, EI_EXCEPTION);
+        if (error != JVMTI_ERROR_NONE) {
+            return JNI_ERR;
+        }
+    }
+
+    /* Set callbacks just for 3 functions */
+    (void)memset(&(gdata->callbacks),0,sizeof(gdata->callbacks));
+    gdata->callbacks.VMInit             = &cbEarlyVMInit;
+    gdata->callbacks.VMDeath            = &cbEarlyVMDeath;
+    gdata->callbacks.Exception  = &cbEarlyException;
+    error = JVMTI_FUNC_PTR(gdata->jvmti,SetEventCallbacks)
+                (gdata->jvmti, &(gdata->callbacks), sizeof(gdata->callbacks));
+    if (error != JVMTI_ERROR_NONE) {
+        ERROR_MESSAGE(("JDWP unable to set JVMTI event callbacks: %s(%d)",
+                        jvmtiErrorText(error), error));
+        return JNI_ERR;
+    }
+
+    LOG_MISC(("OnLoad: DONE"));
+    return JNI_OK;
+}
+
 /*
  * Phase 2: Initial events. Phase 2 consists of waiting for the
  * event that triggers full initialization. Under normal circumstances
